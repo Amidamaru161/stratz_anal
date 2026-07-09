@@ -12,10 +12,10 @@ from app.services.analytics import (
     sync_player_achievements,
     sync_rating,
 )
-from app.services.refresh import RefreshCooldownError, assert_refresh_allowed
+from app.services.refresh import RefreshCooldownError, assert_refresh_allowed, refresh_player
 from app.services.storage import load_player_matches, upsert_match_bundle, upsert_player
 from app.storage.models import Player, SourcePayload
-from app.stratz.client import StratzClient
+from app.stratz.client import StratzAuthError, StratzClient, StratzGraphQLError
 
 
 def seed_player(session: Session) -> None:
@@ -277,3 +277,74 @@ def test_refresh_cooldown_handles_sqlite_naive_datetimes(session: Session) -> No
 
     with pytest.raises(RefreshCooldownError):
         assert_refresh_allowed(session, 99, Settings(refresh_cooldown_seconds=900))
+
+
+@pytest.mark.asyncio
+async def test_refresh_falls_back_to_100_matches_after_limit_rejection(session: Session) -> None:
+    class LimitSensitiveClient:
+        def __init__(self) -> None:
+            self.takes: list[int] = []
+
+        async def fetch_player_bundle(self, account_id: int, take: int) -> dict:
+            self.takes.append(take)
+            if take == 500:
+                raise StratzAuthError("STRATZ token was rejected")
+            return {
+                "player": {
+                    "steamAccount": {"name": "Fallback Player"},
+                    "matches": [],
+                }
+            }
+
+        async def fetch_hero_constants(self) -> dict:
+            return {}
+
+    client = LimitSensitiveClient()
+
+    result = await refresh_player(
+        session,
+        42,
+        settings=Settings(match_history_limit=500),
+        client=client,  # type: ignore[arg-type]
+    )
+
+    source = session.query(SourcePayload).filter_by(operation="player_bundle").one()
+    assert client.takes == [500, 100]
+    assert source.request_json == {"accountId": 42, "take": 100, "requestedTake": 500}
+    assert result["accountId"] == 42
+
+
+@pytest.mark.asyncio
+async def test_refresh_tries_smaller_limits_after_graphql_take_error(session: Session) -> None:
+    class LimitSensitiveClient:
+        def __init__(self) -> None:
+            self.takes: list[int] = []
+
+        async def fetch_player_bundle(self, account_id: int, take: int) -> dict:
+            self.takes.append(take)
+            if take == 500:
+                raise StratzAuthError("STRATZ token was rejected")
+            if take == 100:
+                raise StratzGraphQLError([{"message": "maximum take value is 100"}])
+            return {
+                "player": {
+                    "steamAccount": {"name": "Fallback Player"},
+                    "matches": [],
+                }
+            }
+
+        async def fetch_hero_constants(self) -> dict:
+            return {}
+
+    client = LimitSensitiveClient()
+
+    await refresh_player(
+        session,
+        42,
+        settings=Settings(match_history_limit=500),
+        client=client,  # type: ignore[arg-type]
+    )
+
+    source = session.query(SourcePayload).filter_by(operation="player_bundle").one()
+    assert client.takes == [500, 100, 99]
+    assert source.request_json == {"accountId": 42, "take": 99, "requestedTake": 500}

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -28,7 +30,11 @@ async def test_stratz_client_auth_error(monkeypatch: pytest.MonkeyPatch) -> None
     async def fake_post(self, url, headers=None, json=None):
         return httpx.Response(401, json={})
 
+    async def no_sleep(_: float) -> None:
+        return None
+
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
     with pytest.raises(StratzAuthError):
         await StratzClient(Settings(stratz_token="token")).query("query { ok }")
 

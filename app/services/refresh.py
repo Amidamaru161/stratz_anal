@@ -16,12 +16,15 @@ from app.services.storage import (
     upsert_player,
 )
 from app.storage.models import Player, RefreshJob
-from app.stratz.client import StratzClient
+from app.stratz.client import StratzAuthError, StratzClient, StratzGraphQLError
 from app.stratz.normalizer import extract_matches, normalize_hero_constants, normalize_player
 
 
 class RefreshCooldownError(RuntimeError):
     pass
+
+
+FALLBACK_MATCH_HISTORY_LIMITS = (100, 99, 50, 20)
 
 
 def _as_aware_utc(value: datetime) -> datetime:
@@ -86,12 +89,30 @@ async def refresh_player(
     settings: Settings,
     client: StratzClient,
 ) -> dict[str, Any]:
-    player_bundle = await client.fetch_player_bundle(account_id, settings.match_history_limit)
+    requested_limit = settings.match_history_limit
+    candidate_limits = [requested_limit]
+    candidate_limits.extend(
+        limit for limit in FALLBACK_MATCH_HISTORY_LIMITS if limit < requested_limit
+    )
+    last_error: StratzAuthError | StratzGraphQLError | None = None
+    for used_limit in candidate_limits:
+        try:
+            player_bundle = await client.fetch_player_bundle(account_id, used_limit)
+            break
+        except (StratzAuthError, StratzGraphQLError) as exc:
+            last_error = exc
+    else:
+        assert last_error is not None
+        raise last_error
     save_source_payload(
         session,
         operation="player_bundle",
         account_id=account_id,
-        request_json={"accountId": account_id, "take": settings.match_history_limit},
+        request_json={
+            "accountId": account_id,
+            "take": used_limit,
+            "requestedTake": requested_limit,
+        },
         response_json=player_bundle,
     )
 

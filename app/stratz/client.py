@@ -75,7 +75,12 @@ class StratzClient:
                             + (f"; Cloudflare trace: {cf_trace}" if cf_trace else "")
                         )
                     if response.status_code in {401, 403}:
-                        raise StratzAuthError("STRATZ token was rejected")
+                        auth_error = StratzAuthError("STRATZ token was rejected")
+                        if attempt == 3:
+                            raise auth_error
+                        last_error = auth_error
+                        await asyncio.sleep(0.5 * attempt)
+                        continue
                     if response.status_code == 429:
                         raise StratzRateLimitError("STRATZ rate limit reached")
                     if response.status_code >= 500:

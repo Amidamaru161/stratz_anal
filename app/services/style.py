@@ -10,13 +10,14 @@ from app.analytics.style import ITEM_SLOT_FIELDS, build_style_score
 from app.config import Settings
 from app.services.storage import load_player_matches, save_source_payload, upsert_match_bundle
 from app.storage.models import Player, SourcePayload
-from app.stratz.client import StratzClient
+from app.stratz.client import StratzAuthError, StratzClient, StratzGraphQLError
 from app.stratz.normalizer import extract_matches, normalize_hero_builds
 
 STYLE_META_MIN_MATCHES = 100
 STYLE_META_LIMIT = 30
 STYLE_META_MATCH_LIMIT = 5_000
 STYLE_DETAIL_FETCH_LIMIT = 100
+STYLE_DETAIL_FALLBACK_TAKES = (20,)
 STYLE_META_CONCURRENCY = 4
 
 
@@ -55,13 +56,24 @@ async def _hydrate_style_details(
     missing = [match for match in matches if not _has_style_data(match)]
     if not missing:
         return 0
-    take = min(len(matches), STYLE_DETAIL_FETCH_LIMIT)
-    payload = await client.fetch_player_style_bundle(account_id, take)
+    requested_take = min(len(matches), STYLE_DETAIL_FETCH_LIMIT)
+    candidate_takes = [requested_take]
+    candidate_takes.extend(take for take in STYLE_DETAIL_FALLBACK_TAKES if take < requested_take)
+    last_error: StratzAuthError | StratzGraphQLError | None = None
+    for take in candidate_takes:
+        try:
+            payload = await client.fetch_player_style_bundle(account_id, take)
+            break
+        except (StratzAuthError, StratzGraphQLError) as exc:
+            last_error = exc
+    else:
+        assert last_error is not None
+        raise last_error
     save_source_payload(
         session,
         operation="player_style_bundle",
         account_id=account_id,
-        request_json={"accountId": account_id, "take": take},
+        request_json={"accountId": account_id, "take": take, "requestedTake": requested_take},
         response_json=payload,
     )
     for match_payload in extract_matches(payload):
@@ -101,9 +113,12 @@ async def build_player_style_payload(
     for offset in range(0, len(missing_hero_ids), STYLE_META_CONCURRENCY):
         batch = missing_hero_ids[offset : offset + STYLE_META_CONCURRENCY]
         payloads = await asyncio.gather(
-            *(client.fetch_hero_builds(hero_id, STYLE_META_MATCH_LIMIT) for hero_id in batch)
+            *(client.fetch_hero_builds(hero_id, STYLE_META_MATCH_LIMIT) for hero_id in batch),
+            return_exceptions=True,
         )
         for hero_id, payload in zip(batch, payloads, strict=True):
+            if isinstance(payload, Exception):
+                continue
             save_source_payload(
                 session,
                 operation="hero_builds",
