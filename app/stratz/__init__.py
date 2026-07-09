@@ -1,0 +1,2 @@
+"""STRATZ GraphQL integration."""
+
